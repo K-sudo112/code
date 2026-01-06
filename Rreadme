@@ -1,0 +1,102 @@
+[기술 가이드] Bare-metal 환경 SOEM 포팅 및 모터 제어
+1. 주요 파일별 수정 포인트 (File Modification)
+SOEM 라이브러리 내에서 하드웨어와 직접 연결되는 아래 3가지 파일을 보드 사양(HAL)에 맞춰 수정해야 합니다.
+
+① osal.c (OS Abstraction Layer)
+역할: 정밀 시간 측정 및 지연(Delay).
+
+수정 내용: MCU의 하드웨어 타이머(SysTick 또는 DWT)와 연결.
+
+C
+
+// 수정할 함수: osal_usleep
+void osal_usleep(uint32_t usec) {
+    // 예: STM32 DWT 타이머 사용 시
+    uint32_t start = DWT->CYCCNT;
+    uint32_t ticks = usec * (SystemCoreClock / 1000000);
+    while ((DWT->CYCCNT - start) < ticks);
+}
+
+// 수정할 함수: osal_gettime
+osal_timert osal_gettime(void) {
+    osal_timert time;
+    uint64_t ticks = get_64bit_micros(); // 마이크로초 단위 반환 함수 구현 필요
+    time.sec = ticks / 1000000;
+    time.usec = ticks % 1000000;
+    return time;
+}
+② nicdrv.c (Network Interface Card Driver)
+역할: 실제 Ethernet 패킷 송수신.
+
+수정 내용: 보드의 Ethernet Peripheral(MAC) 드라이버 함수 호출.
+
+C
+
+// 수정할 함수: ec_outpacket
+int ec_outpacket(int idx, int lp) {
+    // SOEM이 만든 패킷(ecx_outbuf)을 보드 TX로 전송
+    if (HAL_ETH_Transmit(&heth, ecx_outbuf[idx], lp, 10) == HAL_OK) 
+        return 1;
+    return 0;
+}
+
+// 수정할 함수: ec_inpacket
+int ec_inpacket(int idx, int timeout) {
+    // 보드 RX 버퍼에서 데이터를 읽어 SOEM 버퍼(ecx_inbuf)에 저장
+    if (HAL_ETH_GetRxDataBuffer(&heth, &ecx_inbuf[idx]) == HAL_OK) {
+        return HAL_ETH_GetRxDataSize(&heth);
+    }
+    return 0;
+}
+③ oshw.c (Operating System Hardware)
+역할: 네트워크 인터페이스 초기화.
+
+수정 내용: OS가 없으므로 인터페이스 탐색 과정을 생략하고 고정된 인터페이스("eth0")를 사용하도록 설정.
+
+C
+
+// 수정할 함수: osal_get_if_list
+int osal_get_if_list(void) {
+    // 가상의 이름 "eth0"을 등록하여 SOEM이 인식하게 함
+    strncpy(ecx_iflist[0], "eth0", OSAL_MAX_IF_NAME_LEN);
+    return 1; 
+}
+2. 초기화 시퀀스 (Initialization Sequence)
+수정 파일: main.c (사용자 애플리케이션) OS가 없는 보드에서 전원 투입 후 실행되는 순서입니다.
+
+HW 초기화: HAL_Init(), Ethernet_Init() (100Mbps 설정).
+
+SOEM 초기화: ec_init("eth0").
+
+슬레이브 탐색: ec_config_init(FALSE).
+
+메모리 맵핑: ec_config_map(&IOmap).
+
+상태 전환: ec_statecheck()를 통해 SAFE_OP 거쳐 OP(Operational) 상태로 진입.
+
+3. 실전 모터 구동 주의사항 (Motor Control Tips)
+① 주기적 통신 (Cyclic Task)
+수정 위치: stm32xx_it.c (타이머 인터럽트 핸들러)
+
+모터 제어는 1ms 주기가 정확해야 하므로 타이머 인터럽트 내에서 통신 함수를 호출합니다.
+
+C
+
+void TIM1_UP_IRQHandler(void) {
+    ec_send_processdata(); // 마스터 명령 송신
+    ec_receive_processdata(EC_TIMEOUTRET); // 슬레이브 상태 수신
+    
+    // CiA402 제어 로직 실행
+}
+② CiA402 모터 Servo On 시퀀스
+모터 드라이버를 OP 상태로 만든 후, 아래의 ControlWord 값을 순차적으로 써줘야 실제 구동이 가능합니다.
+
+Step 1: 0x0006 (Ready to Switch On)
+
+Step 2: 0x0007 (Switched On)
+
+Step 3: 0x000F (Enable Operation) → 모터 축 잠김(Servo On)
+
+정리 방법: 이 텍스트를 워드(Word)에 복사해 넣으시고, Image of... 라고 써진 부분에 제가 이전에 설명드린 개념도(EtherCAT 상태 머신 등)를 참고하여 직접 캡처하거나 그려서 넣으시면 완벽한 PDF 보고서가 됩니다.
+
+혹시 특정 보드(예: STM32H7 등)의 이더넷 DMA 설정값까지 포함된 더 상세한 코드가 필요하신가요? 구체적인 칩셋 모델명을 주시면 바로 작성해 드릴 수 있습니다.
